@@ -1,0 +1,261 @@
+pipeline {
+    agent any
+    environment {
+        JAVA_11_HOME = '/usr/lib/jvm/java-11-amazon-corretto'
+        JAVA_17_HOME = '/usr/lib/jvm/java-17-amazon-corretto'
+        ROOT_DIR = 'softeon'
+        MAVEN_HOME = '/opt/maven'
+        SONARQUBE_SERVER = 'http://192.168.30.10:9000'
+    }
+    stages {
+        stage('Cleanup Workspace') {
+            steps {
+                script {
+                    echo "Cleaning up workspace for job: ${env.JOB_NAME}"
+                    sh "rm -rf ${env.WORKSPACE}/*"
+                    echo "Cleanup completed."
+                }
+            }
+        }
+        stage('Checkout') {
+            steps {
+                script {
+                    echo "Checking out repository"
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/main'], [name: '*/feature/*']],
+                        userRemoteConfigs: [[
+                            url: 'https://github.com/Softeon-Inc/framework-CICD',
+                            credentialsId: 'mahesh_git_cred'
+                        ]]
+                    ])
+                    sh 'git fetch --all --prune'
+
+                    def currentBranch = sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
+                    if (currentBranch == 'HEAD') {
+                        def branchesContainingCommit = sh(script: 'git branch -r --contains HEAD', returnStdout: true).trim()
+                        def branchList = branchesContainingCommit.tokenize().collect { it.replaceAll('\\*', '').trim() }
+
+                        if (branchList.size() > 0) {
+                            def targetBranch = branchList[0]
+                            echo "HEAD is detached, checking out branch: ${targetBranch}"
+                            sh "git checkout ${targetBranch.replace('origin/', '')}"
+                            env.branchName = targetBranch.replace('origin/', '')
+                        } else {
+                            error "Detached HEAD and no branches found containing the commit."
+                        }
+                    } else {
+                        env.branchName = currentBranch
+                    }
+
+                    echo "Branch name is ${env.branchName}"
+                }
+            }
+        }
+        stage('Extract Committer Info') {
+            steps {
+                script {
+                    def committerName = sh(
+                        script: "git log -1 --pretty=format:'%an'",
+                        returnStdout: true
+                    ).trim()
+                    env.COMMITTER_NAME = committerName
+                    echo "Committer Name: ${env.COMMITTER_NAME}"
+                }
+            }
+        }
+        stage('Determine Java Version and Setup') {
+            steps {
+                script {
+                    dir("${env.WORKSPACE}/${env.ROOT_DIR}/services/features-installer") {
+                        def javaVersion = sh(
+                            script: "xmllint --xpath '//*[local-name()=\"properties\"]/*[local-name()=\"maven.compiler.source\"]/text()' pom.xml 2>/dev/null || echo 'error'",
+                            returnStdout: true
+                        ).trim()
+
+                        if (javaVersion == 'error' || !javaVersion) {
+                            error "Failed to retrieve Java version from pom.xml. Please check the file."
+                        }
+
+                        echo "Java compiler source version in pom.xml: ${javaVersion}"
+                        env.JAVA_HOME = (javaVersion == '17') ? env.JAVA_17_HOME : env.JAVA_11_HOME
+                    }
+                }
+            }
+        }
+        stage('Extract Version') {
+            when {
+                expression {
+                    env.branchName ==~ /^[0-9]+\.[0-9]+(-snapshot)?$/ || env.branchName ==~ /^[0-9]+\.[0-9]+$/
+                }
+            }
+            steps {
+                script {
+                    def version = sh(script: """
+                        POM_FILE="${env.WORKSPACE}/${env.ROOT_DIR}/services/features-installer/pom.xml"
+                        VERSION_NO=\$(grep -oP '(?<=<leap.core.starter.version>).*?(?=</leap.core.starter.version>)' "\$POM_FILE")
+                        echo \$VERSION_NO
+                    """, returnStdout: true).trim()
+
+                    if (!version) {
+                        error "Version not found in pom.xml. Exiting build."
+                    }
+
+                    echo "Extracted Version: ${version}"
+                    env.VERSION_NO = version
+                }
+            }
+        }
+        stage('Build') {
+            steps {
+                script {
+                    echo "Building for branch: ${env.branchName}"
+
+                    if (env.branchName ==~ /^[0-9]+\.[0-9]+(-snapshot)?$/ || env.branchName ==~ /^[0-9]+\.[0-9]+$/) {
+                        sh """
+                            cd ${env.WORKSPACE}/${env.ROOT_DIR}/services
+                            chmod +x maven-build.sh
+                            . /etc/profile.d/maven.sh
+                            ./maven-build.sh "${env.VERSION_NO}"
+                        """
+                    } else if (env.branchName.startsWith('feature/') || env.branchName == 'main') {
+                        sh """
+                            cd ${env.WORKSPACE}/${env.ROOT_DIR}/services
+                            chmod +x maven-build.sh
+                            . /etc/profile.d/maven.sh
+                            ./maven-build.sh
+                            cd ${env.WORKSPACE}/${env.ROOT_DIR}/services/leap-core/target/
+                            ls -lrth
+                        """
+                    } else {
+                        error "Unsupported branch: ${env.branchName}"
+                    }
+                }
+            }
+        }
+        stage('Publish Artifact') {
+            when {
+                expression {
+                    env.branchName ==~ /^[0-9]+\.[0-9]+(-snapshot)?$/ || env.branchName ==~ /^[0-9]+\.[0-9]+$/
+                }
+            }
+            steps {
+                script {
+                    if (env.VERSION_NO.contains("-SNAPSHOT")) {
+                        echo "Deploying to SNAPSHOT repository"
+                        sh '''
+                            . /etc/profile.d/maven.sh
+                            cd ${WORKSPACE}/${ROOT_DIR}/services/leap-core/target/
+                            mvn deploy:deploy-file \
+                                -DartifactId="leap-core-starter" \
+                                -DgroupId="com.softeon" \
+                                -Dpackaging="jar" \
+                                -Dversion="${VERSION_NO}" \
+                                -Dfile="leap-core-starter-${VERSION_NO}.jar" \
+                                -DrepositoryId="nexus-deploy" \
+                                -Durl="https://nexus-dev.softeon.com/repository/maven-snapshots"
+                        '''
+                    } else {
+                        echo "Deploying to RELEASE repository"
+                        sh '''
+                            . /etc/profile.d/maven.sh
+                            cd ${WORKSPACE}/${ROOT_DIR}/services/leap-core/target/
+                            mvn deploy:deploy-file \
+                                -DartifactId="leap-core-starter" \
+                                -DgroupId="com.softeon" \
+                                -Dpackaging="jar" \
+                                -Dversion="${VERSION_NO}" \
+                                -Dfile="leap-core-starter-${VERSION_NO}.jar" \
+                                -DrepositoryId="nexus-deploy" \
+                                -Durl="https://nexus-dev.softeon.com/repository/maven-releases"
+                        '''
+                    }
+                }
+            }
+        }
+        stage('features-installer') {
+            steps {
+                script {
+                    echo "Maven build for features-installer"
+                    sh '''
+                        cd ${WORKSPACE}/${ROOT_DIR}/services/features-installer
+                        rm -f .classpath .project tm.out.* tmlog* .epoch
+                        rm -rf target .settings
+                        . /etc/profile.d/maven.sh
+                        mvn clean install
+                    '''
+                }
+            }
+        }
+        stage('Code Coverage Check with SonarQube') {
+            steps {
+                script {
+                    def components = ['leap-framework', 'leap-core', 'features-installer']
+                    withCredentials([usernamePassword(credentialsId: 'sonarqube_credentials', usernameVariable: 'SONAR_USER', passwordVariable: 'SONAR_TOKEN')]) {
+                        for (component in components) {
+                            def rawResponse = sh(
+                                script: "curl -u ${SONAR_USER}:${SONAR_TOKEN} -X GET \"${SONARQUBE_SERVER}/api/measures/component?component=com.softeon%3A${component}&metricKeys=coverage\"",
+                                returnStdout: true
+                            ).trim()
+
+                            def coveragePercentage = sh(script: "echo '${rawResponse}' | jq -r '.component.measures[0].value'", returnStdout: true).trim()
+
+                            echo "Coverage percentage for ${component}: ${coveragePercentage}"
+
+                            if (coveragePercentage.toFloat() < 25.0) {
+                                error "Overall code coverage of ${component} is below 25%. Exiting with an error."
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                def backgroundColor = (currentBuild.currentResult == 'SUCCESS') ? '#2e7d32' : '#b71c1c'
+                try {
+                    sh "zip -j ${env.WORKSPACE}/build-log.zip ${env.WORKSPACE}/build.log || true"
+                } catch (e) {
+                    echo "Failed to zip log: ${e.message}"
+                }
+                emailext(
+                    to: 'jenkins_notify@softeon.com',
+                    subject: "Jenkins Notification from ${env.JOB_NAME}: Build ${currentBuild.currentResult}",
+                    body: """
+                        <html>
+                          <body style="background-color: ${backgroundColor}; color: #ffffff; font-family: Arial, sans-serif;">
+                            <h2 style="background-color: ${backgroundColor}; padding: 10px; text-align: center; color: #ffffff;">Jenkins Build Details</h2>
+                            <table style="width: 100%; border-collapse: collapse;">
+                              <tr style="background-color: #2e7d32; color: #ffffff;">
+                                <th style="padding: 8px; border: 1px solid #ddd;">Name</th>
+                                <th style="padding: 8px; border: 1px solid #ddd;">Value</th>
+                              </tr>
+                              <tr style="border: 1px solid #ddd; text-align: left;">
+                                <td>Job Name</td><td>${env.JOB_NAME}</td>
+                              </tr>
+                              <tr style="border: 1px solid #ddd; text-align: left;">
+                                <td>Branch</td><td>${env.branchName}</td>
+                              </tr>
+                              <tr style="border: 1px solid #ddd; text-align: left;">
+                                <td>Committer</td><td>${env.COMMITTER_NAME}</td>
+                              </tr>
+                              <tr style="border: 1px solid #ddd; text-align: left;">
+                                <td>Status</td><td>${currentBuild.currentResult}</td>
+                              </tr>
+                              <tr style="border: 1px solid #ddd; text-align: left;">
+                                <td>Duration</td><td>${currentBuild.durationString}</td>
+                              </tr>
+                            </table>
+                          </body>
+                        </html>
+                    """,
+                    mimeType: 'text/html',
+                    attachLog: true,
+                    attachmentsPattern: "${WORKSPACE}/build-log.zip"
+                )
+            }
+        }
+    }
+}
